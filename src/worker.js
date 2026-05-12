@@ -11,7 +11,9 @@ const UA =
 
 const KV_LAST_STATE = `state:${SKU}`;
 const KV_LAST_ALERT = `alert_ts:${SKU}`;
+const KV_LAST_ERROR_ALERT = `error_alert_ts:${SKU}`;
 const REPEAT_ALERT_HOURS = 6;
+const ERROR_ALERT_THROTTLE_MINUTES = 30;
 
 async function fetchAvailability() {
   const res = await fetch(AVAILABILITY_URL, {
@@ -131,21 +133,59 @@ async function check(env, { source }) {
   };
 }
 
+async function pingHeartbeat(env, suffix = "") {
+  if (!env.HEALTHCHECK_URL) return;
+  try {
+    await fetch(env.HEALTHCHECK_URL + suffix, { method: "GET" });
+  } catch (e) {
+    console.error("heartbeat ping failed:", e.message);
+  }
+}
+
+async function notifyError(env, err) {
+  console.error("scheduled error:", err.message);
+  const target = env.DISCORD_WEBHOOK_ERRORS || env.DISCORD_WEBHOOK;
+  if (!target) return;
+  const now = Date.now();
+  const lastTs = parseInt(
+    (await env.STATE.get(KV_LAST_ERROR_ALERT)) || "0",
+    10
+  );
+  const minsSince = (now - lastTs) / 60000;
+  if (minsSince < ERROR_ALERT_THROTTLE_MINUTES) {
+    console.log(`error alert throttled (${minsSince.toFixed(1)}m since last)`);
+    return;
+  }
+  await fetch(target, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "BestBuy Watcher",
+      embeds: [
+        {
+          title: "[ERROR] Primary watcher failing",
+          description: `SKU ${SKU}\n\n\`\`\`${err.message.slice(0, 500)}\`\`\`\n\n_Throttled to one alert per ${ERROR_ALERT_THROTTLE_MINUTES} min. Investigate Cloudflare logs: \`npx wrangler tail\`._`,
+          color: 0xe74c3c,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    }),
+  }).catch(() => {});
+  await env.STATE.put(KV_LAST_ERROR_ALERT, String(now));
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      check(env, { source: "cron" }).catch(async (err) => {
-        console.error("scheduled error:", err.message);
-        if (env.DISCORD_WEBHOOK_ERRORS) {
-          await fetch(env.DISCORD_WEBHOOK_ERRORS, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              content: `BestBuy watcher error: ${err.message}`,
-            }),
-          }).catch(() => {});
+      (async () => {
+        try {
+          await check(env, { source: "cron" });
+          await pingHeartbeat(env);
+        } catch (err) {
+          await pingHeartbeat(env, "/fail");
+          await notifyError(env, err);
         }
-      })
+      })()
     );
   },
 

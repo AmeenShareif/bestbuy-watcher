@@ -122,3 +122,30 @@ jobs:
             exit 1
           fi
           echo "Alert sent."
+
+      - name: Ping heartbeat (optional)
+        if: success() && env.HEALTHCHECK_URL_BACKUP != ''
+        env:
+          HEALTHCHECK_URL_BACKUP: ${{ secrets.HEALTHCHECK_URL_BACKUP }}
+        run: curl -sS -m 10 "$HEALTHCHECK_URL_BACKUP" || true
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          [ -z "${DISCORD_WEBHOOK:-}" ] && exit 0
+          PAYLOAD=$(jq -n \
+            --arg url "$RUN_URL" \
+            '{
+              username: "BestBuy Watcher",
+              embeds: [{
+                title: "[BACKUP-ERROR] Backup watcher run failed",
+                description: ("GitHub Actions run failed. Investigate: " + $url),
+                color: 15158332,
+                timestamp: (now | todateiso8601)
+              }]
+            }')
+          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
