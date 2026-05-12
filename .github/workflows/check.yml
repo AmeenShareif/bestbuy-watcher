@@ -124,10 +124,15 @@ jobs:
           echo "Alert sent."
 
       - name: Ping heartbeat (optional)
-        if: success() && env.HEALTHCHECK_URL_BACKUP != ''
+        if: success()
         env:
           HEALTHCHECK_URL_BACKUP: ${{ secrets.HEALTHCHECK_URL_BACKUP }}
-        run: curl -sS -m 10 "$HEALTHCHECK_URL_BACKUP" || true
+        run: |
+          if [ -n "${HEALTHCHECK_URL_BACKUP:-}" ]; then
+            curl -sS -m 10 "$HEALTHCHECK_URL_BACKUP" || true
+          else
+            echo "HEALTHCHECK_URL_BACKUP not set — skipping heartbeat ping"
+          fi
 
       - name: Notify Discord on failure
         if: failure()

@@ -23,6 +23,7 @@ async function fetchAvailability() {
       "Accept-Language": "en-CA,en;q=0.9",
     },
     cf: { cacheTtl: 0, cacheEverything: false },
+    signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error(`API HTTP ${res.status}`);
   const data = await res.json();
@@ -87,6 +88,7 @@ async function postDiscord(webhook, body) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
@@ -136,7 +138,10 @@ async function check(env, { source }) {
 async function pingHeartbeat(env, suffix = "") {
   if (!env.HEALTHCHECK_URL) return;
   try {
-    await fetch(env.HEALTHCHECK_URL + suffix, { method: "GET" });
+    await fetch(env.HEALTHCHECK_URL + suffix, {
+      method: "GET",
+      signal: AbortSignal.timeout(5000),
+    });
   } catch (e) {
     console.error("heartbeat ping failed:", e.message);
   }
