@@ -1,0 +1,124 @@
+name: BestBuy Backup Watcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      simulate:
+        description: "Set true to send a test [BACKUP-SIMULATION] alert"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bestbuy-backup
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check Best Buy availability and alert if in stock
+        env:
+          SKU: "13799023"
+          PRODUCT_URL: "https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023"
+          PRODUCT_NAME: "Canon PowerShot G7 X Mark III"
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SIMULATE: ${{ github.event.inputs.simulate }}
+        run: |
+          set -euo pipefail
+
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          API="https://www.bestbuy.ca/ecomm-api/availability/products?accept=application%2Fvnd.bestbuy.standardproduct.v1%2Bjson&accept-language=en-CA&skus=${SKU}"
+
+          echo "Polling $API"
+          RESP=$(curl -sS -A "$UA" -H "Accept: application/vnd.bestbuy.standardproduct.v1+json" -H "Accept-Language: en-CA" "$API")
+          echo "Raw response: $RESP"
+
+          SHIPPING_STATUS=$(echo "$RESP" | jq -r '.availabilities[0].shipping.status // "Unknown"')
+          SHIPPING_PURCHASABLE=$(echo "$RESP" | jq -r '.availabilities[0].shipping.purchasable // false')
+          BACKORDERABLE=$(echo "$RESP" | jq -r '.availabilities[0].shipping.isBackorderable // false')
+          QTY=$(echo "$RESP" | jq -r '.availabilities[0].shipping.quantityRemaining // 0')
+          PICKUP_PURCHASABLE=$(echo "$RESP" | jq -r '.availabilities[0].pickup.purchasable // false')
+          PICKUP_STATUS=$(echo "$RESP" | jq -r '.availabilities[0].pickup.status // "Unknown"')
+
+          echo "shipping=$SHIPPING_STATUS purchasable=$SHIPPING_PURCHASABLE backorder=$BACKORDERABLE qty=$QTY pickup=$PICKUP_STATUS pickupPurchasable=$PICKUP_PURCHASABLE"
+
+          SIGNAL="out"
+          TITLE_PREFIX="[BACKUP]"
+          COLOR=2895667
+          if [ "$SHIPPING_PURCHASABLE" = "true" ]; then
+            SIGNAL="in_stock_online"
+            TITLE="BACK IN STOCK — Available Online"
+            COLOR=3066993
+          elif [ "$BACKORDERABLE" = "true" ]; then
+            SIGNAL="backorder"
+            TITLE="BACKORDER AVAILABLE"
+            COLOR=15844367
+          elif [ "$PICKUP_PURCHASABLE" = "true" ]; then
+            SIGNAL="pickup_only"
+            TITLE="IN-STORE PICKUP AVAILABLE"
+            COLOR=3447003
+          fi
+
+          if [ "${SIMULATE:-false}" = "true" ]; then
+            SIGNAL="in_stock_online"
+            TITLE="BACK IN STOCK — Available Online"
+            COLOR=10181046
+            TITLE_PREFIX="[BACKUP-SIMULATION]"
+            echo "Simulation mode: forcing in-stock alert"
+          fi
+
+          if [ "$SIGNAL" = "out" ]; then
+            echo "Out of stock. No alert."
+            exit 0
+          fi
+
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "ERROR: DISCORD_WEBHOOK secret not set" >&2
+            exit 1
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE_PREFIX $TITLE" \
+            --arg desc "**$PRODUCT_NAME**\nSKU $SKU\n\n_Sent by GitHub Actions backup watcher (5-min poll, independent from Cloudflare Worker)._" \
+            --arg url "$PRODUCT_URL" \
+            --argjson color "$COLOR" \
+            --arg shipping "$SHIPPING_STATUS" \
+            --arg pickup "$PICKUP_STATUS" \
+            --arg qty "$QTY" \
+            --arg backorder "$BACKORDERABLE" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              username: "BestBuy Backup Watcher",
+              embeds: [{
+                title: $title,
+                description: $desc,
+                url: $url,
+                color: $color,
+                fields: [
+                  {name: "Shipping", value: $shipping, inline: true},
+                  {name: "Pickup", value: $pickup, inline: true},
+                  {name: "Qty", value: $qty, inline: true},
+                  {name: "Backorderable", value: $backorder, inline: true}
+                ],
+                timestamp: $ts,
+                footer: {text: "GitHub Actions backup • bestbuy.ca availability API"}
+              }]
+            }')
+
+          echo "Posting to Discord..."
+          HTTP=$(curl -sS -o /tmp/discord_resp.txt -w "%{http_code}" \
+            -X POST -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "$DISCORD_WEBHOOK")
+          echo "Discord HTTP $HTTP"
+          if [ "$HTTP" -ge 400 ]; then
+            echo "Discord error response:"
+            cat /tmp/discord_resp.txt
+            exit 1
+          fi
+          echo "Alert sent."

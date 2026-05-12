@@ -1,0 +1,10 @@
+name = "bestbuy-watcher"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "2438a663ce634c30b942bb5a301877f9"
