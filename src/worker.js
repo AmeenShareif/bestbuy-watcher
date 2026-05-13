@@ -12,8 +12,11 @@ const UA =
 const KV_LAST_STATE = `state:${SKU}`;
 const KV_LAST_ALERT = `alert_ts:${SKU}`;
 const KV_LAST_ERROR_ALERT = `error_alert_ts:${SKU}`;
+const KV_LAST_WEEKLY_PING = `weekly_ping_ts:${SKU}`;
+const KV_FIRST_SEEN = `first_seen_ts:${SKU}`;
 const REPEAT_ALERT_HOURS = 6;
 const ERROR_ALERT_THROTTLE_MINUTES = 30;
+const WEEKLY_PING_DAYS = 7;
 
 async function fetchAvailability() {
   const res = await fetch(AVAILABILITY_URL, {
@@ -147,6 +150,44 @@ async function pingHeartbeat(env, suffix = "") {
   }
 }
 
+async function maybeWeeklyPing(env, snapshot) {
+  if (!env.DISCORD_WEBHOOK) return;
+  const now = Date.now();
+  const lastTs = parseInt(
+    (await env.STATE.get(KV_LAST_WEEKLY_PING)) || "0",
+    10
+  );
+  const firstSeenTs = parseInt(
+    (await env.STATE.get(KV_FIRST_SEEN)) || "0",
+    10
+  );
+  if (!firstSeenTs) {
+    await env.STATE.put(KV_FIRST_SEEN, String(now));
+  }
+  const daysSince = (now - lastTs) / 86_400_000;
+  if (lastTs > 0 && daysSince < WEEKLY_PING_DAYS) return;
+  const daysMonitoring = firstSeenTs
+    ? Math.floor((now - firstSeenTs) / 86_400_000)
+    : 0;
+  await fetch(env.DISCORD_WEBHOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "BestBuy Watcher",
+      embeds: [
+        {
+          title: "[STATUS] Watcher healthy",
+          description: `Weekly check-in.\n**${PRODUCT_NAME}** (SKU ${SKU}) — still ${snapshot.shippingStatus.toLowerCase()}.\nDays monitoring: ${daysMonitoring}.\n\n_If you stop getting these weekly pings, the watcher is down._`,
+          color: 0x95a5a6,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(10000),
+  }).catch(() => {});
+  await env.STATE.put(KV_LAST_WEEKLY_PING, String(now));
+}
+
 async function notifyError(env, err) {
   console.error("scheduled error:", err.message);
   const target = env.DISCORD_WEBHOOK_ERRORS || env.DISCORD_WEBHOOK;
@@ -184,8 +225,9 @@ export default {
     ctx.waitUntil(
       (async () => {
         try {
-          await check(env, { source: "cron" });
+          const result = await check(env, { source: "cron" });
           await pingHeartbeat(env);
+          await maybeWeeklyPing(env, result.snapshot);
         } catch (err) {
           await pingHeartbeat(env, "/fail");
           await notifyError(env, err);
@@ -196,6 +238,18 @@ export default {
 
   async fetch(req, env) {
     const url = new URL(req.url);
+    const PROTECTED = new Set(["/check", "/test-alert", "/simulate-restock", "/reset"]);
+    if (PROTECTED.has(url.pathname)) {
+      const requiredToken = env.ADMIN_TOKEN;
+      if (requiredToken) {
+        const provided =
+          url.searchParams.get("token") ||
+          (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+        if (provided !== requiredToken) {
+          return new Response("unauthorized", { status: 401 });
+        }
+      }
+    }
     if (url.pathname === "/check") {
       try {
         const result = await check(env, { source: "manual" });
