@@ -26,7 +26,7 @@ async function fetchAvailability() {
       "Accept-Language": "en-CA,en;q=0.9",
     },
     cf: { cacheTtl: 0, cacheEverything: false },
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(25000),
   });
   if (!res.ok) throw new Error(`API HTTP ${res.status}`);
   const data = await res.json();
@@ -229,6 +229,15 @@ export default {
           await pingHeartbeat(env);
           await maybeWeeklyPing(env, result.snapshot);
         } catch (err) {
+          const isTransient =
+            err.name === "TimeoutError" ||
+            err.name === "AbortError" ||
+            /aborted due to timeout/i.test(err.message);
+          if (isTransient) {
+            console.warn("transient error, skipping alert:", err.message);
+            await pingHeartbeat(env, "/fail");
+            return;
+          }
           await pingHeartbeat(env, "/fail");
           await notifyError(env, err);
         }
