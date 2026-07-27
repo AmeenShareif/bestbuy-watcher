@@ -9,11 +9,23 @@ const AVAILABILITY_URL =
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+// Coach (ca.coach.com) sits behind Akamai, which 403s Cloudflare Workers on
+// client fingerprint no matter what headers are sent — verified against both
+// the product page and the JSON API. So the Coach stock check has to run on a
+// GitHub runner, and this Worker's job is to keep that runner firing: GitHub's
+// own cron is late or skips entirely, and it disables scheduled workflows
+// after 60 days of repo inactivity. coach.yml keeps its own cron entries, so
+// if this Worker dies GitHub still runs it, and if GitHub's scheduler dies
+// this Worker still triggers it.
+const GH_REPO = "AmeenShareif/bestbuy-watcher";
+const COACH_WORKFLOW = "coach.yml";
+
 const KV_LAST_STATE = `state:${SKU}`;
 const KV_LAST_ALERT = `alert_ts:${SKU}`;
 const KV_LAST_ERROR_ALERT = `error_alert_ts:${SKU}`;
 const KV_LAST_WEEKLY_PING = `weekly_ping_ts:${SKU}`;
 const KV_FIRST_SEEN = `first_seen_ts:${SKU}`;
+const KV_LAST_GH_ALERT = "gh_alert_ts";
 const REPEAT_ALERT_HOURS = 6;
 const ERROR_ALERT_THROTTLE_MINUTES = 30;
 const WEEKLY_PING_DAYS = 7;
@@ -222,10 +234,67 @@ async function notifyError(env, err) {
   await env.STATE.put(KV_LAST_ERROR_ALERT, String(now));
 }
 
+async function notifyGhFailure(env, err) {
+  console.error("coach trigger failed:", err.message);
+  const target = env.DISCORD_WEBHOOK_ERRORS || env.DISCORD_WEBHOOK;
+  if (!target) return;
+  const now = Date.now();
+  const lastTs = parseInt((await env.STATE.get(KV_LAST_GH_ALERT)) || "0", 10);
+  if ((now - lastTs) / 60000 < ERROR_ALERT_THROTTLE_MINUTES) return;
+  await fetch(target, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "Coach Watcher",
+      embeds: [
+        {
+          title: "[ERROR] Cannot trigger the Coach watcher",
+          description: `GitHub Actions is not accepting runs, so the Coach bag may not be being checked. **Check it manually.**\n\n\`\`\`${err.message.slice(0, 400)}\`\`\`\n\n_Throttled to one alert per ${ERROR_ALERT_THROTTLE_MINUTES} min. coach.yml's own cron may still be running it._`,
+          color: 0xe74c3c,
+          timestamp: new Date().toISOString(),
+        },
+      ],
+    }),
+  }).catch(() => {});
+  await env.STATE.put(KV_LAST_GH_ALERT, String(now));
+}
+
+async function triggerCoachWatcher(env) {
+  if (!env.GH_TOKEN) return { triggered: false, reason: "GH_TOKEN not set" };
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${GH_REPO}/actions/workflows/${COACH_WORKFLOW}/dispatches`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.GH_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "bestbuy-watcher",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ref: "main" }),
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+    if (res.status !== 204) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`GitHub dispatch HTTP ${res.status}: ${txt.slice(0, 200)}`);
+    }
+    return { triggered: true };
+  } catch (err) {
+    await notifyGhFailure(env, err);
+    return { triggered: false, reason: err.message };
+  }
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
+        // First — the transient branch below returns early, and this must not
+        // be skipped just because Best Buy had a bad minute.
+        await triggerCoachWatcher(env);
         try {
           const result = await check(env, { source: "cron" });
           await pingHeartbeat(env);

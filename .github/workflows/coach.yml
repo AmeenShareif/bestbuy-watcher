@@ -41,10 +41,58 @@ jobs:
           BASE="https://ca.coach.com/on/demandware.store/Sites-coh_ca_one-Site/en_CA/Product-Variation?pid="
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-          # pre-encoded pid | colour name.  Colours come from the ProductGroup
-          # JSON-LD on $PRODUCT_URL — add a line here if Coach adds a colour.
+          # Known colours, used only if discovery below fails — the watcher
+          # must never go blind just because the page markup changed.
           VARIANTS="CCY33%20B4WBR|Brass/Warm Brown
           CCY33%20B4%2FAY|Brass/Clay"
+
+          # Discover the live colour list from the PDP's ProductGroup JSON-LD,
+          # so a colour Coach adds later is watched without a code change.
+          if curl -sS --compressed -o page.html \
+              -A "$UA" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -H "Accept-Language: en-CA,en;q=0.9" \
+              -H "sec-ch-ua: \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"" \
+              -H "sec-ch-ua-mobile: ?0" \
+              -H "sec-ch-ua-platform: \"Windows\"" \
+              -H "Sec-Fetch-Dest: document" \
+              -H "Sec-Fetch-Mode: navigate" \
+              -H "Sec-Fetch-Site: none" \
+              -H "Sec-Fetch-User: ?1" \
+              -H "Upgrade-Insecure-Requests: 1" \
+              "$PRODUCT_URL"; then
+            DISCOVERED=$(python3 - <<'PY'
+          import json, re, urllib.parse
+          html = open("page.html", encoding="utf-8", errors="replace").read()
+          out = []
+          for block in re.findall(
+              r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S):
+              try:
+                  data = json.loads(block.strip())
+              except ValueError:
+                  continue
+              for node in (data if isinstance(data, list) else [data]):
+                  if not isinstance(node, dict) or node.get("@type") != "ProductGroup":
+                      continue
+                  for v in node.get("hasVariant") or []:
+                      sku, color = v.get("sku"), v.get("color")
+                      if sku and color:
+                          # safe="" so the "/" in a sku like "CCY33 B4/AY"
+                          # becomes %2F — a bare slash is not accepted here.
+                          out.append(f"{urllib.parse.quote(sku, safe='')}|{color}")
+          print("\n".join(dict.fromkeys(out)))
+          PY
+          )
+            if [ -n "$DISCOVERED" ]; then
+              echo "Discovered $(echo "$DISCOVERED" | wc -l) colour(s) from JSON-LD"
+              VARIANTS="$DISCOVERED"
+            else
+              echo "WARNING: colour discovery found nothing — using known colours" >&2
+            fi
+          else
+            echo "WARNING: could not load PDP for colour discovery — using known colours" >&2
+          fi
+          echo "$VARIANTS"
 
           ANY_IN_STOCK=false
           FIELDS="[]"
