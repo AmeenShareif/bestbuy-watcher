@@ -260,7 +260,9 @@ async function notifyGhFailure(env, err) {
 }
 
 async function triggerCoachWatcher(env) {
-  if (!env.GH_TOKEN) return { triggered: false, reason: "GH_TOKEN not set" };
+  // Empty counts as missing: `wrangler secret put` run without a usable stdin
+  // uploads an empty string, and the secret then lists fine but is falsy here.
+  if (!env.GH_TOKEN) return { triggered: false, reason: "GH_TOKEN missing or empty" };
   try {
     const res = await fetch(
       `https://api.github.com/repos/${GH_REPO}/actions/workflows/${COACH_WORKFLOW}/dispatches`,
@@ -294,7 +296,10 @@ export default {
       (async () => {
         // First — the transient branch below returns early, and this must not
         // be skipped just because Best Buy had a bad minute.
-        await triggerCoachWatcher(env);
+        // Quiet when it works; loud when it doesn't — a silently skipped
+        // trigger is indistinguishable from a healthy run otherwise.
+        const gh = await triggerCoachWatcher(env);
+        if (!gh.triggered) console.log("coach trigger skipped:", gh.reason);
         try {
           const result = await check(env, { source: "cron" });
           await pingHeartbeat(env);
