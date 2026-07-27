@@ -5,7 +5,11 @@ name: Coach Bag Watcher
 # So this workflow is the PRIMARY watcher for the Coach bag, not a backup.
 
 on:
-  # schedule enabled after the first green dispatch run
+  schedule:
+    # Two offset entries -> a check roughly every 2.5 min (5 min is the
+    # finest a single GitHub cron entry gets). Add more offsets to tighten.
+    - cron: "1,6,11,16,21,26,31,36,41,46,51,56 * * * *"
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
   workflow_dispatch:
     inputs:
       simulate:
@@ -140,7 +144,7 @@ jobs:
           fi
           echo "Alert sent."
 
-      - name: Notify Discord on failure
+      - name: Notify Discord on failure (throttled)
         if: failure()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -148,6 +152,10 @@ jobs:
         run: |
           set +e
           [ -z "${DISCORD_WEBHOOK:-}" ] && exit 0
+          # ponytail: a runner has no state store, so throttle by wall clock —
+          # a sustained outage pings ~twice an hour instead of every run.
+          MIN=$(date -u +%-M)
+          if [ $((MIN % 30)) -ge 3 ]; then echo "error alert throttled"; exit 0; fi
           PAYLOAD=$(jq -n \
             --arg url "$RUN_URL" \
             '{
