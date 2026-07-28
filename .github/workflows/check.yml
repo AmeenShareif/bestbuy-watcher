@@ -10,6 +10,10 @@ on:
         description: "Set true to send a test [BACKUP-SIMULATION] alert"
         required: false
         default: "false"
+      sku:
+        description: "Limit this run to one SKU (blank = all)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -27,6 +31,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SIMULATE: ${{ github.event.inputs.simulate }}
+          ONLY_SKU: ${{ github.event.inputs.sku }}
         run: |
           set -euo pipefail
 
@@ -47,6 +52,10 @@ jobs:
           while IFS='|' read -r SKU PRODUCT_NAME CONDITION PRODUCT_URL; do
             SKU=$(echo "$SKU" | tr -d ' ')
             [ -z "$SKU" ] && continue
+            if [ -n "${ONLY_SKU:-}" ] && [ "$SKU" != "$ONLY_SKU" ]; then
+              echo "$SKU: skipped (run limited to $ONLY_SKU)"
+              continue
+            fi
 
             REC=$(echo "$RESP" | jq -c --arg s "$SKU" '.availabilities[]? | select((.sku|tostring) == $s)')
             if [ -z "$REC" ]; then
