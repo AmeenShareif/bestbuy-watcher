@@ -1,10 +1,22 @@
-const SKU = "13799023";
-const PRODUCT_URL =
-  "https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023";
-const PRODUCT_NAME = "Canon PowerShot G7 X Mark III";
+const PRODUCTS = [
+  {
+    sku: "13799023",
+    name: "Canon PowerShot G7 X Mark III",
+    url: "https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023",
+  },
+  {
+    sku: "14350718",
+    name: "Canon PowerShot G7 X Mark III (Open Box)",
+    url: "https://www.bestbuy.ca/en-CA/product/open-box-canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/14350718",
+  },
+];
 
+// One request covers every SKU — the API takes a "|"-separated list (%7C).
+// A comma is rejected with HTTP 412.
 const AVAILABILITY_URL =
-  `https://www.bestbuy.ca/ecomm-api/availability/products?accept=application%2Fvnd.bestbuy.standardproduct.v1%2Bjson&accept-language=en-CA&skus=${SKU}`;
+  `https://www.bestbuy.ca/ecomm-api/availability/products?accept=application%2Fvnd.bestbuy.standardproduct.v1%2Bjson&accept-language=en-CA&skus=${PRODUCTS.map(
+    (p) => p.sku
+  ).join("%7C")}`;
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -20,11 +32,15 @@ const UA =
 const GH_REPO = "AmeenShareif/bestbuy-watcher";
 const COACH_WORKFLOW = "coach.yml";
 
-const KV_LAST_STATE = `state:${SKU}`;
-const KV_LAST_ALERT = `alert_ts:${SKU}`;
-const KV_LAST_ERROR_ALERT = `error_alert_ts:${SKU}`;
-const KV_LAST_WEEKLY_PING = `weekly_ping_ts:${SKU}`;
-const KV_FIRST_SEEN = `first_seen_ts:${SKU}`;
+// Per-product state. Same key shape as before, so 13799023 keeps its history.
+const kvKeys = (sku) => ({ state: `state:${sku}`, alert: `alert_ts:${sku}` });
+
+// Worker-wide rather than per product: one liveness ping, one error alert for
+// the shared request. Keyed on the first product's existing entries so the
+// throttle state and "days monitoring" count carry over from the single-SKU era.
+const KV_LAST_ERROR_ALERT = `error_alert_ts:${PRODUCTS[0].sku}`;
+const KV_LAST_WEEKLY_PING = `weekly_ping_ts:${PRODUCTS[0].sku}`;
+const KV_FIRST_SEEN = `first_seen_ts:${PRODUCTS[0].sku}`;
 const KV_LAST_GH_ALERT = "gh_alert_ts";
 const REPEAT_ALERT_HOURS = 6;
 const ERROR_ALERT_THROTTLE_MINUTES = 30;
@@ -42,17 +58,21 @@ async function fetchAvailability() {
   });
   if (!res.ok) throw new Error(`API HTTP ${res.status}`);
   const data = await res.json();
-  const a = data?.availabilities?.[0];
-  if (!a) throw new Error("No availability record");
-  return {
-    shippingStatus: a.shipping?.status ?? "Unknown",
-    shippingPurchasable: !!a.shipping?.purchasable,
-    backorderable: !!a.shipping?.isBackorderable,
-    quantityRemaining: a.shipping?.quantityRemaining ?? 0,
-    pickupPurchasable: !!a.pickup?.purchasable,
-    pickupStatus: a.pickup?.status ?? "Unknown",
-    raw: a,
-  };
+  const records = data?.availabilities ?? [];
+  if (!records.length) throw new Error("No availability record");
+  const bySku = {};
+  for (const a of records) {
+    bySku[String(a.sku)] = {
+      shippingStatus: a.shipping?.status ?? "Unknown",
+      shippingPurchasable: !!a.shipping?.purchasable,
+      backorderable: !!a.shipping?.isBackorderable,
+      quantityRemaining: a.shipping?.quantityRemaining ?? 0,
+      pickupPurchasable: !!a.pickup?.purchasable,
+      pickupStatus: a.pickup?.status ?? "Unknown",
+      raw: a,
+    };
+  }
+  return bySku;
 }
 
 function inStockSignal(a) {
@@ -62,7 +82,7 @@ function inStockSignal(a) {
   return "out";
 }
 
-function buildDiscordMessage(signal, a) {
+function buildDiscordMessage(product, signal, a) {
   const titles = {
     in_stock_online: "BACK IN STOCK — Available Online",
     backorder: "BACKORDER AVAILABLE",
@@ -78,8 +98,8 @@ function buildDiscordMessage(signal, a) {
     embeds: [
       {
         title: titles[signal],
-        description: `**${PRODUCT_NAME}**\nSKU ${SKU}`,
-        url: PRODUCT_URL,
+        description: `**${product.name}**\nSKU ${product.sku}`,
+        url: product.url,
         color: colors[signal],
         fields: [
           { name: "Shipping", value: a.shippingStatus, inline: true },
@@ -111,45 +131,66 @@ async function postDiscord(webhook, body) {
   }
 }
 
-async function check(env, { source }) {
-  const a = await fetchAvailability();
-  const signal = inStockSignal(a);
-  const prevSignal = (await env.STATE.get(KV_LAST_STATE)) || "out";
-  const lastAlertTs = parseInt(
-    (await env.STATE.get(KV_LAST_ALERT)) || "0",
-    10
-  );
+async function check(env, { source, products = PRODUCTS }) {
+  const bySku = await fetchAvailability();
   const now = Date.now();
-  const hoursSinceAlert = (now - lastAlertTs) / 3_600_000;
+  const results = [];
 
-  const isInStockNow = signal !== "out";
-  const wasOutBefore = prevSignal === "out";
-  const signalChanged = signal !== prevSignal;
-  const dueForRepeat =
-    isInStockNow && hoursSinceAlert >= REPEAT_ALERT_HOURS;
+  for (const product of products) {
+    const a = bySku[product.sku];
+    if (!a) {
+      // A delisted SKU must not take the other products down with it.
+      console.warn(`no availability record for ${product.sku}`);
+      results.push({
+        source,
+        sku: product.sku,
+        product: product.name,
+        error: "no availability record",
+      });
+      continue;
+    }
 
-  const shouldAlert =
-    isInStockNow && (wasOutBefore || signalChanged || dueForRepeat);
+    const k = kvKeys(product.sku);
+    const signal = inStockSignal(a);
+    const prevSignal = (await env.STATE.get(k.state)) || "out";
+    const lastAlertTs = parseInt((await env.STATE.get(k.alert)) || "0", 10);
+    const hoursSinceAlert = (now - lastAlertTs) / 3_600_000;
 
-  if (shouldAlert) {
-    if (!env.DISCORD_WEBHOOK) throw new Error("DISCORD_WEBHOOK not set");
-    await postDiscord(env.DISCORD_WEBHOOK, buildDiscordMessage(signal, a));
-    await env.STATE.put(KV_LAST_ALERT, String(now));
+    const isInStockNow = signal !== "out";
+    const wasOutBefore = prevSignal === "out";
+    const signalChanged = signal !== prevSignal;
+    const dueForRepeat =
+      isInStockNow && hoursSinceAlert >= REPEAT_ALERT_HOURS;
+
+    const shouldAlert =
+      isInStockNow && (wasOutBefore || signalChanged || dueForRepeat);
+
+    if (shouldAlert) {
+      if (!env.DISCORD_WEBHOOK) throw new Error("DISCORD_WEBHOOK not set");
+      await postDiscord(
+        env.DISCORD_WEBHOOK,
+        buildDiscordMessage(product, signal, a)
+      );
+      await env.STATE.put(k.alert, String(now));
+    }
+
+    if (signal !== prevSignal) {
+      await env.STATE.put(k.state, signal);
+    }
+
+    results.push({
+      source,
+      sku: product.sku,
+      product: product.name,
+      signal,
+      prevSignal,
+      alerted: shouldAlert,
+      snapshot: a,
+      hoursSinceAlert: Number(hoursSinceAlert.toFixed(2)),
+    });
   }
 
-  if (signal !== prevSignal) {
-    await env.STATE.put(KV_LAST_STATE, signal);
-  }
-
-  return {
-    source,
-    sku: SKU,
-    signal,
-    prevSignal,
-    alerted: shouldAlert,
-    snapshot: a,
-    hoursSinceAlert: Number(hoursSinceAlert.toFixed(2)),
-  };
+  return results;
 }
 
 async function pingHeartbeat(env, suffix = "") {
@@ -164,7 +205,7 @@ async function pingHeartbeat(env, suffix = "") {
   }
 }
 
-async function maybeWeeklyPing(env, snapshot) {
+async function maybeWeeklyPing(env, results) {
   if (!env.DISCORD_WEBHOOK) return;
   const now = Date.now();
   const lastTs = parseInt(
@@ -191,7 +232,14 @@ async function maybeWeeklyPing(env, snapshot) {
       embeds: [
         {
           title: "[STATUS] Watcher healthy",
-          description: `Weekly check-in.\n**${PRODUCT_NAME}** (SKU ${SKU}) — still ${snapshot.shippingStatus.toLowerCase()}.\nDays monitoring: ${daysMonitoring}.\n\n_If you stop getting these weekly pings, the watcher is down._`,
+          description: `Weekly check-in.\n${results
+            .map(
+              (r) =>
+                `**${r.product}** (SKU ${r.sku}) — ${
+                  r.error ? `⚠ ${r.error}` : `still ${r.snapshot.shippingStatus.toLowerCase()}`
+                }`
+            )
+            .join("\n")}\nDays monitoring: ${daysMonitoring}.\n\n_If you stop getting these weekly pings, the watcher is down._`,
           color: 0x95a5a6,
           timestamp: new Date().toISOString(),
         },
@@ -224,7 +272,7 @@ async function notifyError(env, err) {
       embeds: [
         {
           title: "[ERROR] Primary watcher failing",
-          description: `SKU ${SKU}\n\n\`\`\`${err.message.slice(0, 500)}\`\`\`\n\n_Throttled to one alert per ${ERROR_ALERT_THROTTLE_MINUTES} min. Investigate Cloudflare logs: \`npx wrangler tail\`._`,
+          description: `SKUs ${PRODUCTS.map((p) => p.sku).join(", ")}\n\n\`\`\`${err.message.slice(0, 500)}\`\`\`\n\n_Throttled to one alert per ${ERROR_ALERT_THROTTLE_MINUTES} min. Investigate Cloudflare logs: \`npx wrangler tail\`._`,
           color: 0xe74c3c,
           timestamp: new Date().toISOString(),
         },
@@ -290,6 +338,12 @@ async function triggerCoachWatcher(env) {
   }
 }
 
+// ?sku=<id> narrows the admin endpoints to one product; default is all.
+function selectProducts(url) {
+  const sku = url.searchParams.get("sku");
+  return sku ? PRODUCTS.filter((p) => p.sku === sku) : PRODUCTS;
+}
+
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
@@ -301,9 +355,9 @@ export default {
         const gh = await triggerCoachWatcher(env);
         if (!gh.triggered) console.log("coach trigger skipped:", gh.reason);
         try {
-          const result = await check(env, { source: "cron" });
+          const results = await check(env, { source: "cron" });
           await pingHeartbeat(env);
-          await maybeWeeklyPing(env, result.snapshot);
+          await maybeWeeklyPing(env, results);
         } catch (err) {
           const isTransient =
             err.name === "TimeoutError" ||
@@ -334,56 +388,67 @@ export default {
           return new Response("unauthorized", { status: 401 });
         }
       }
+      // An unknown ?sku= must not silently fall through to "all products".
+      if (selectProducts(url).length === 0) {
+        return new Response("unknown sku", { status: 404 });
+      }
     }
     if (url.pathname === "/check") {
       try {
-        const result = await check(env, { source: "manual" });
+        const result = await check(env, {
+          source: "manual",
+          products: selectProducts(url),
+        });
         return Response.json(result);
       } catch (err) {
         return new Response(`error: ${err.message}`, { status: 500 });
       }
     }
     if (url.pathname === "/reset") {
-      await env.STATE.delete(KV_LAST_STATE);
-      await env.STATE.delete(KV_LAST_ALERT);
+      for (const p of selectProducts(url)) {
+        const k = kvKeys(p.sku);
+        await env.STATE.delete(k.state);
+        await env.STATE.delete(k.alert);
+      }
       return new Response("state cleared");
     }
     if (url.pathname === "/simulate-restock") {
       try {
         if (!env.DISCORD_WEBHOOK)
           return new Response("DISCORD_WEBHOOK not set", { status: 500 });
-        const prevState = (await env.STATE.get(KV_LAST_STATE)) || "out";
-        const prevAlertTs = (await env.STATE.get(KV_LAST_ALERT)) || "0";
-        const fakeSnapshot = {
-          shippingStatus: "AvailableToOrder",
-          shippingPurchasable: true,
-          backorderable: false,
-          quantityRemaining: 5,
-          pickupPurchasable: false,
-          pickupStatus: "NotAvailable",
-          raw: { simulated: true },
-        };
-        const signal = inStockSignal(fakeSnapshot);
-        const isInStockNow = signal !== "out";
-        const wasOutBefore = prevState === "out";
-        const signalChanged = signal !== prevState;
-        const shouldAlert =
-          isInStockNow && (wasOutBefore || signalChanged);
-        let alerted = false;
-        if (shouldAlert) {
-          const msg = buildDiscordMessage(signal, fakeSnapshot);
-          msg.embeds[0].title = "[SIMULATION] " + msg.embeds[0].title;
-          msg.embeds[0].description +=
-            "\n\n_This is a simulated restock running the real alert logic. State has been restored — live monitoring continues._";
-          await postDiscord(env.DISCORD_WEBHOOK, msg);
-          alerted = true;
-        }
-        await env.STATE.put(KV_LAST_STATE, prevState);
-        await env.STATE.put(KV_LAST_ALERT, prevAlertTs);
-        return Response.json({
-          ok: true,
-          simulated: true,
-          decision: {
+        const decisions = [];
+        for (const product of selectProducts(url)) {
+          const k = kvKeys(product.sku);
+          const prevState = (await env.STATE.get(k.state)) || "out";
+          const prevAlertTs = (await env.STATE.get(k.alert)) || "0";
+          const fakeSnapshot = {
+            shippingStatus: "AvailableToOrder",
+            shippingPurchasable: true,
+            backorderable: false,
+            quantityRemaining: 5,
+            pickupPurchasable: false,
+            pickupStatus: "NotAvailable",
+            raw: { simulated: true },
+          };
+          const signal = inStockSignal(fakeSnapshot);
+          const isInStockNow = signal !== "out";
+          const wasOutBefore = prevState === "out";
+          const signalChanged = signal !== prevState;
+          const shouldAlert = isInStockNow && (wasOutBefore || signalChanged);
+          let alerted = false;
+          if (shouldAlert) {
+            const msg = buildDiscordMessage(product, signal, fakeSnapshot);
+            msg.embeds[0].title = "[SIMULATION] " + msg.embeds[0].title;
+            msg.embeds[0].description +=
+              "\n\n_This is a simulated restock running the real alert logic. State has been restored — live monitoring continues._";
+            await postDiscord(env.DISCORD_WEBHOOK, msg);
+            alerted = true;
+          }
+          await env.STATE.put(k.state, prevState);
+          await env.STATE.put(k.alert, prevAlertTs);
+          decisions.push({
+            sku: product.sku,
+            product: product.name,
             simulatedSignal: signal,
             storedStateBefore: prevState,
             isInStockNow,
@@ -391,7 +456,12 @@ export default {
             signalChanged,
             shouldAlert,
             alerted,
-          },
+          });
+        }
+        return Response.json({
+          ok: true,
+          simulated: true,
+          decisions,
           note: "Stored state was restored to its original value. Live cron continues monitoring real API.",
         });
       } catch (err) {
@@ -402,28 +472,40 @@ export default {
       try {
         if (!env.DISCORD_WEBHOOK)
           return new Response("DISCORD_WEBHOOK not set", { status: 500 });
-        const a = await fetchAvailability();
-        const fakeSignal = "in_stock_online";
-        const msg = buildDiscordMessage(fakeSignal, a);
-        msg.embeds[0].title = "[TEST] " + msg.embeds[0].title;
-        msg.embeds[0].description +=
-          "\n\n_This is a test alert. Stored state was NOT modified — live monitoring continues._";
-        msg.embeds[0].color = 0x9b59b6;
-        await postDiscord(env.DISCORD_WEBHOOK, msg);
-        const prevState = (await env.STATE.get(KV_LAST_STATE)) || "out";
+        const bySku = await fetchAvailability();
+        const sent = [];
+        for (const product of selectProducts(url)) {
+          const a = bySku[product.sku];
+          if (!a) continue;
+          const msg = buildDiscordMessage(product, "in_stock_online", a);
+          msg.embeds[0].title = "[TEST] " + msg.embeds[0].title;
+          msg.embeds[0].description +=
+            "\n\n_This is a test alert. Stored state was NOT modified — live monitoring continues._";
+          msg.embeds[0].color = 0x9b59b6;
+          await postDiscord(env.DISCORD_WEBHOOK, msg);
+          sent.push({
+            sku: product.sku,
+            product: product.name,
+            storedState: (await env.STATE.get(kvKeys(product.sku).state)) || "out",
+            currentSnapshot: a,
+          });
+        }
         return Response.json({
           ok: true,
           test: true,
-          message: "Test alert sent. Stored state untouched.",
-          storedState: prevState,
-          currentSnapshot: a,
+          message: "Test alert(s) sent. Stored state untouched.",
+          sent,
         });
       } catch (err) {
         return new Response(`error: ${err.message}`, { status: 500 });
       }
     }
     return new Response(
-      `BestBuy Watcher\nSKU: ${SKU}\n\nEndpoints:\n  GET /check             - run a real check now\n  GET /test-alert        - send a test Discord message (no state change)\n  GET /simulate-restock  - run real alert logic against a fake in-stock response\n  GET /reset             - clear stored state\n`,
+      `BestBuy Watcher\n\nWatching:\n${PRODUCTS.map(
+        (p) => `  ${p.sku}  ${p.name}`
+      ).join(
+        "\n"
+      )}\n\nEndpoints (add ?sku=<id> to target one product):\n  GET /check             - run a real check now\n  GET /test-alert        - send a test Discord message (no state change)\n  GET /simulate-restock  - run real alert logic against a fake in-stock response\n  GET /reset             - clear stored state\n`,
       { headers: { "Content-Type": "text/plain" } }
     );
   },
