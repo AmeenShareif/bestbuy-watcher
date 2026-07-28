@@ -30,9 +30,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # sku|name|url — must mirror PRODUCTS in src/worker.js.
-          PRODUCTS="13799023|Canon PowerShot G7 X Mark III|https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023
-          14350718|Canon PowerShot G7 X Mark III (Open Box)|https://www.bestbuy.ca/en-CA/product/open-box-canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/14350718"
+          # sku|name|condition|url — must mirror PRODUCTS in src/worker.js.
+          PRODUCTS="13799023|Canon PowerShot G7 X Mark III|NEW|https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023
+          14350718|Canon PowerShot G7 X Mark III|OPEN BOX|https://www.bestbuy.ca/en-CA/product/open-box-canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/14350718"
 
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           # %7C = "|", the multi-SKU separator this API expects; a comma 412s.
@@ -44,7 +44,7 @@ jobs:
           echo "Raw response: $RESP"
 
           FAILED=0
-          while IFS='|' read -r SKU PRODUCT_NAME PRODUCT_URL; do
+          while IFS='|' read -r SKU PRODUCT_NAME CONDITION PRODUCT_URL; do
             SKU=$(echo "$SKU" | tr -d ' ')
             [ -z "$SKU" ] && continue
 
@@ -100,10 +100,11 @@ jobs:
             fi
 
             PAYLOAD=$(jq -n \
-              --arg title "$TITLE_PREFIX $TITLE" \
-              --arg desc "**$PRODUCT_NAME**\nSKU $SKU\n\n_Sent by GitHub Actions backup watcher (5-min poll, independent from Cloudflare Worker)._" \
+              --arg title "$TITLE_PREFIX [$CONDITION] $TITLE" \
+              --arg desc "**$PRODUCT_NAME**\n$CONDITION · SKU $SKU\n\n_Sent by GitHub Actions backup watcher (independent from the Cloudflare Worker)._" \
               --arg url "$PRODUCT_URL" \
               --argjson color "$COLOR" \
+              --arg condition "$CONDITION" \
               --arg shipping "$SHIPPING_STATUS" \
               --arg pickup "$PICKUP_STATUS" \
               --arg qty "$QTY" \
@@ -117,6 +118,7 @@ jobs:
                   url: $url,
                   color: $color,
                   fields: [
+                    {name: "Condition", value: $condition, inline: true},
                     {name: "Shipping", value: $shipping, inline: true},
                     {name: "Pickup", value: $pickup, inline: true},
                     {name: "Qty", value: $qty, inline: true},

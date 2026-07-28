@@ -2,11 +2,13 @@ const PRODUCTS = [
   {
     sku: "13799023",
     name: "Canon PowerShot G7 X Mark III",
+    condition: "NEW",
     url: "https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023",
   },
   {
     sku: "14350718",
-    name: "Canon PowerShot G7 X Mark III (Open Box)",
+    name: "Canon PowerShot G7 X Mark III",
+    condition: "OPEN BOX",
     url: "https://www.bestbuy.ca/en-CA/product/open-box-canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/14350718",
   },
 ];
@@ -97,11 +99,14 @@ function buildDiscordMessage(product, signal, a) {
     username: "BestBuy Watcher",
     embeds: [
       {
-        title: titles[signal],
-        description: `**${product.name}**\nSKU ${product.sku}`,
+        // Condition leads the title: two near-identical cameras alert into the
+        // same channel, and "which one is this?" must be answerable at a glance.
+        title: `[${product.condition}] ${titles[signal]}`,
+        description: `**${product.name}**\n${product.condition} · SKU ${product.sku}`,
         url: product.url,
         color: colors[signal],
         fields: [
+          { name: "Condition", value: product.condition, inline: true },
           { name: "Shipping", value: a.shippingStatus, inline: true },
           { name: "Pickup", value: a.pickupStatus, inline: true },
           { name: "Qty", value: String(a.quantityRemaining), inline: true },
@@ -145,6 +150,7 @@ async function check(env, { source, products = PRODUCTS }) {
         source,
         sku: product.sku,
         product: product.name,
+        condition: product.condition,
         error: "no availability record",
       });
       continue;
@@ -182,6 +188,7 @@ async function check(env, { source, products = PRODUCTS }) {
       source,
       sku: product.sku,
       product: product.name,
+      condition: product.condition,
       signal,
       prevSignal,
       alerted: shouldAlert,
@@ -235,7 +242,7 @@ async function maybeWeeklyPing(env, results) {
           description: `Weekly check-in.\n${results
             .map(
               (r) =>
-                `**${r.product}** (SKU ${r.sku}) — ${
+                `**${r.product}** (${r.condition} · SKU ${r.sku}) — ${
                   r.error ? `⚠ ${r.error}` : `still ${r.snapshot.shippingStatus.toLowerCase()}`
                 }`
             )
