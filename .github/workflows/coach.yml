@@ -1,218 +1,22 @@
 name: Coach Bag Watcher
 
-# Coach is behind Akamai, which blocks Cloudflare Workers on TLS fingerprint
-# (verified: identical headers -> 403 AkamaiGHost from workerd, 200 from curl).
-# So this workflow is the PRIMARY watcher for the Coach bag, not a backup.
+# DISABLED 2026-08-16. Coach bag checks are off. Only the open-box G7 X
+# (SKU 14350718) is watched. File kept so history stays. No schedule.
+# workflow_dispatch remains if someone intentionally re-enables later.
 
 on:
-  schedule:
-    # Two offset entries -> a check roughly every 2.5 min (5 min is the
-    # finest a single GitHub cron entry gets). Add more offsets to tighten.
-    - cron: "1,6,11,16,21,26,31,36,41,46,51,56 * * * *"
-    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
   workflow_dispatch:
     inputs:
       simulate:
-        description: "Set true to send a test [SIMULATION] alert"
+        description: "DISABLED. Do not run unless you intentionally re-enable Coach."
         required: false
         default: "false"
 
 permissions:
   contents: read
 
-concurrency:
-  group: coach-watcher
-  cancel-in-progress: false
-
 jobs:
-  check:
+  disabled:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
     steps:
-      - name: Check Coach availability and alert if in stock
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          SIMULATE: ${{ github.event.inputs.simulate }}
-        run: |
-          set -euo pipefail
-
-          PRODUCT_NAME="Coach Lana Shoulder Bag 19"
-          PRODUCT_URL="https://ca.coach.com/en/products/lana-shoulder-bag-19/CCY33.html"
-          BASE="https://ca.coach.com/on/demandware.store/Sites-coh_ca_one-Site/en_CA/Product-Variation?pid="
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-          # Known colours, used only if discovery below fails — the watcher
-          # must never go blind just because the page markup changed.
-          VARIANTS="CCY33%20B4WBR|Brass/Warm Brown
-          CCY33%20B4%2FAY|Brass/Clay"
-
-          # Discover the live colour list from the PDP's ProductGroup JSON-LD,
-          # so a colour Coach adds later is watched without a code change.
-          if curl -sS --compressed -o page.html \
-              -A "$UA" \
-              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-              -H "Accept-Language: en-CA,en;q=0.9" \
-              -H "sec-ch-ua: \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"" \
-              -H "sec-ch-ua-mobile: ?0" \
-              -H "sec-ch-ua-platform: \"Windows\"" \
-              -H "Sec-Fetch-Dest: document" \
-              -H "Sec-Fetch-Mode: navigate" \
-              -H "Sec-Fetch-Site: none" \
-              -H "Sec-Fetch-User: ?1" \
-              -H "Upgrade-Insecure-Requests: 1" \
-              "$PRODUCT_URL"; then
-            DISCOVERED=$(python3 - <<'PY'
-          import json, re, urllib.parse
-          html = open("page.html", encoding="utf-8", errors="replace").read()
-          out = []
-          for block in re.findall(
-              r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S):
-              try:
-                  data = json.loads(block.strip())
-              except ValueError:
-                  continue
-              for node in (data if isinstance(data, list) else [data]):
-                  if not isinstance(node, dict) or node.get("@type") != "ProductGroup":
-                      continue
-                  for v in node.get("hasVariant") or []:
-                      sku, color = v.get("sku"), v.get("color")
-                      if sku and color:
-                          # safe="" so the "/" in a sku like "CCY33 B4/AY"
-                          # becomes %2F — a bare slash is not accepted here.
-                          out.append(f"{urllib.parse.quote(sku, safe='')}|{color}")
-          print("\n".join(dict.fromkeys(out)))
-          PY
-          )
-            if [ -n "$DISCOVERED" ]; then
-              echo "Discovered $(echo "$DISCOVERED" | wc -l) colour(s) from JSON-LD"
-              VARIANTS="$DISCOVERED"
-            else
-              echo "WARNING: colour discovery found nothing — using known colours" >&2
-            fi
-          else
-            echo "WARNING: could not load PDP for colour discovery — using known colours" >&2
-          fi
-          echo "$VARIANTS"
-
-          ANY_IN_STOCK=false
-          FIELDS="[]"
-
-          while IFS='|' read -r PID COLOR; do
-            PID=$(echo "$PID" | xargs)
-            echo "Polling $COLOR ($PID)"
-            HTTP=$(curl -sS --compressed -o resp.json -w "%{http_code}" \
-              -A "$UA" \
-              -H "Accept: application/json, text/javascript, */*; q=0.01" \
-              -H "X-Requested-With: XMLHttpRequest" \
-              -H "Accept-Language: en-CA,en;q=0.9" \
-              -H "Referer: $PRODUCT_URL" \
-              -H "sec-ch-ua: \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"" \
-              -H "sec-ch-ua-mobile: ?0" \
-              -H "sec-ch-ua-platform: \"Windows\"" \
-              -H "Sec-Fetch-Dest: empty" \
-              -H "Sec-Fetch-Mode: cors" \
-              -H "Sec-Fetch-Site: same-origin" \
-              "${BASE}${PID}")
-
-            if [ "$HTTP" != "200" ]; then
-              echo "ERROR: HTTP $HTTP for $COLOR" >&2
-              head -c 400 resp.json >&2 || true
-              exit 1
-            fi
-
-            AVAILABLE=$(jq -r '.product.available // false' resp.json)
-            ATS=$(jq -r '.product.availability.ATS // 0' resp.json)
-            PRICE=$(jq -r '.product.price.sales.formatted // "?"' resp.json)
-            MSG=$(jq -r '.product.availability.messages[0] // "?"' resp.json)
-            echo "  available=$AVAILABLE ATS=$ATS price=$PRICE msg=$MSG"
-
-            # OR, not AND: a missed restock costs more than a false alarm.
-            IN_STOCK=false
-            if [ "$AVAILABLE" = "true" ] || [ "${ATS%%.*}" -gt 0 ] 2>/dev/null; then
-              IN_STOCK=true
-              ANY_IN_STOCK=true
-            fi
-
-            if [ "$IN_STOCK" = "true" ]; then
-              VALUE="**IN STOCK** — $PRICE · $ATS left"
-            else
-              VALUE="Sold out — $PRICE"
-            fi
-            FIELDS=$(echo "$FIELDS" | jq --arg n "$COLOR" --arg v "$VALUE" \
-              '. + [{name: $n, value: $v, inline: true}]')
-          done <<< "$VARIANTS"
-
-          TITLE_PREFIX=""
-          COLOR_INT=3066993
-          if [ "${SIMULATE:-false}" = "true" ]; then
-            ANY_IN_STOCK=true
-            TITLE_PREFIX="[SIMULATION] "
-            COLOR_INT=10181046
-            echo "Simulation mode: forcing in-stock alert"
-          fi
-
-          if [ "$ANY_IN_STOCK" != "true" ]; then
-            echo "Sold out. No alert."
-            exit 0
-          fi
-
-          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
-            echo "ERROR: DISCORD_WEBHOOK secret not set" >&2
-            exit 1
-          fi
-
-          PAYLOAD=$(jq -n \
-            --arg title "${TITLE_PREFIX}BACK IN STOCK — Available Online" \
-            --arg desc "**$PRODUCT_NAME**\nStyle CCY33" \
-            --arg url "$PRODUCT_URL" \
-            --argjson color "$COLOR_INT" \
-            --argjson fields "$FIELDS" \
-            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{
-              username: "Coach Watcher",
-              embeds: [{
-                title: $title,
-                description: $desc,
-                url: $url,
-                color: $color,
-                fields: $fields,
-                timestamp: $ts,
-                footer: {text: "GitHub Actions • ca.coach.com product API"}
-              }]
-            }')
-
-          echo "Posting to Discord..."
-          HTTP=$(curl -sS -o discord_resp.txt -w "%{http_code}" \
-            -X POST -H "Content-Type: application/json" \
-            -d "$PAYLOAD" "$DISCORD_WEBHOOK")
-          echo "Discord HTTP $HTTP"
-          if [ "$HTTP" -ge 400 ]; then
-            cat discord_resp.txt
-            exit 1
-          fi
-          echo "Alert sent."
-
-      - name: Notify Discord on failure (throttled)
-        if: failure()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set +e
-          [ -z "${DISCORD_WEBHOOK:-}" ] && exit 0
-          # ponytail: a runner has no state store, so throttle by wall clock —
-          # a sustained outage pings ~twice an hour instead of every run.
-          MIN=$(date -u +%-M)
-          if [ $((MIN % 30)) -ge 3 ]; then echo "error alert throttled"; exit 0; fi
-          PAYLOAD=$(jq -n \
-            --arg url "$RUN_URL" \
-            '{
-              username: "Coach Watcher",
-              embeds: [{
-                title: "[ERROR] Coach watcher run failed",
-                description: ("Coach check failed (likely an Akamai block or a site change). Investigate: " + $url),
-                color: 15158332,
-                timestamp: (now | todateiso8601)
-              }]
-            }')
-          curl -sS -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
+      - run: echo "Coach watcher is disabled. Open-box G7X only."
