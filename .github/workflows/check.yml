@@ -36,8 +36,7 @@ jobs:
           set -euo pipefail
 
           # sku|name|condition|url — must mirror PRODUCTS in src/worker.js.
-          PRODUCTS="13799023|Canon PowerShot G7 X Mark III|NEW|https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023
-          14350718|Canon PowerShot G7 X Mark III|OPEN BOX|https://www.bestbuy.ca/en-CA/product/open-box-canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/14350718"
+          PRODUCTS="14350718|Canon PowerShot G7 X Mark III|OPEN BOX|https://www.bestbuy.ca/en-CA/product/open-box-canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/14350718"
 
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           # %7C = "|", the multi-SKU separator this API expects; a comma 412s.
