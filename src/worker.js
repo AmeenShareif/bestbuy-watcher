@@ -1,11 +1,5 @@
 const PRODUCTS = [
   {
-    sku: "13799023",
-    name: "Canon PowerShot G7 X Mark III",
-    condition: "NEW",
-    url: "https://www.bestbuy.ca/en-ca/product/canon-powershot-g7-x-mark-iii-wi-fi-20-1mp-4-2x-optical-zoom-digital-camera-black/13799023",
-  },
-  {
     sku: "14350718",
     name: "Canon PowerShot G7 X Mark III",
     condition: "OPEN BOX",
@@ -23,18 +17,7 @@ const AVAILABILITY_URL =
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// Coach (ca.coach.com) sits behind Akamai, which 403s Cloudflare Workers on
-// client fingerprint no matter what headers are sent — verified against both
-// the product page and the JSON API. So the Coach stock check has to run on a
-// GitHub runner, and this Worker's job is to keep that runner firing: GitHub's
-// own cron is late or skips entirely, and it disables scheduled workflows
-// after 60 days of repo inactivity. coach.yml keeps its own cron entries, so
-// if this Worker dies GitHub still runs it, and if GitHub's scheduler dies
-// this Worker still triggers it.
-const GH_REPO = "AmeenShareif/bestbuy-watcher";
-const COACH_WORKFLOW = "coach.yml";
-
-// Per-product state. Same key shape as before, so 13799023 keeps its history.
+// Per-product state. Keyed on the watched SKU.
 const kvKeys = (sku) => ({ state: `state:${sku}`, alert: `alert_ts:${sku}` });
 
 // Worker-wide rather than per product: one liveness ping, one error alert for
@@ -43,7 +26,6 @@ const kvKeys = (sku) => ({ state: `state:${sku}`, alert: `alert_ts:${sku}` });
 const KV_LAST_ERROR_ALERT = `error_alert_ts:${PRODUCTS[0].sku}`;
 const KV_LAST_WEEKLY_PING = `weekly_ping_ts:${PRODUCTS[0].sku}`;
 const KV_FIRST_SEEN = `first_seen_ts:${PRODUCTS[0].sku}`;
-const KV_LAST_GH_ALERT = "gh_alert_ts";
 const REPEAT_ALERT_HOURS = 6;
 const ERROR_ALERT_THROTTLE_MINUTES = 30;
 const WEEKLY_PING_DAYS = 7;
@@ -99,8 +81,6 @@ function buildDiscordMessage(product, signal, a) {
     username: "BestBuy Watcher",
     embeds: [
       {
-        // Condition leads the title: two near-identical cameras alert into the
-        // same channel, and "which one is this?" must be answerable at a glance.
         title: `[${product.condition}] ${titles[signal]}`,
         description: `**${product.name}**\n${product.condition} · SKU ${product.sku}`,
         url: product.url,
@@ -144,7 +124,6 @@ async function check(env, { source, products = PRODUCTS }) {
   for (const product of products) {
     const a = bySku[product.sku];
     if (!a) {
-      // A delisted SKU must not take the other products down with it.
       console.warn(`no availability record for ${product.sku}`);
       results.push({
         source,
@@ -289,63 +268,6 @@ async function notifyError(env, err) {
   await env.STATE.put(KV_LAST_ERROR_ALERT, String(now));
 }
 
-async function notifyGhFailure(env, err) {
-  console.error("coach trigger failed:", err.message);
-  const target = env.DISCORD_WEBHOOK_ERRORS || env.DISCORD_WEBHOOK;
-  if (!target) return;
-  const now = Date.now();
-  const lastTs = parseInt((await env.STATE.get(KV_LAST_GH_ALERT)) || "0", 10);
-  if ((now - lastTs) / 60000 < ERROR_ALERT_THROTTLE_MINUTES) return;
-  await fetch(target, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username: "Coach Watcher",
-      embeds: [
-        {
-          title: "[ERROR] Cannot trigger the Coach watcher",
-          description: `GitHub Actions is not accepting runs, so the Coach bag may not be being checked. **Check it manually.**\n\n\`\`\`${err.message.slice(0, 400)}\`\`\`\n\n_Throttled to one alert per ${ERROR_ALERT_THROTTLE_MINUTES} min. coach.yml's own cron may still be running it._`,
-          color: 0xe74c3c,
-          timestamp: new Date().toISOString(),
-        },
-      ],
-    }),
-  }).catch(() => {});
-  await env.STATE.put(KV_LAST_GH_ALERT, String(now));
-}
-
-async function triggerCoachWatcher(env) {
-  // Empty counts as missing: `wrangler secret put` run without a usable stdin
-  // uploads an empty string, and the secret then lists fine but is falsy here.
-  if (!env.GH_TOKEN) return { triggered: false, reason: "GH_TOKEN missing or empty" };
-  try {
-    const res = await fetch(
-      `https://api.github.com/repos/${GH_REPO}/actions/workflows/${COACH_WORKFLOW}/dispatches`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.GH_TOKEN}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "User-Agent": "bestbuy-watcher",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ ref: "main" }),
-        signal: AbortSignal.timeout(10000),
-      }
-    );
-    if (res.status !== 204) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`GitHub dispatch HTTP ${res.status}: ${txt.slice(0, 200)}`);
-    }
-    return { triggered: true };
-  } catch (err) {
-    await notifyGhFailure(env, err);
-    return { triggered: false, reason: err.message };
-  }
-}
-
-// ?sku=<id> narrows the admin endpoints to one product; default is all.
 function selectProducts(url) {
   const sku = url.searchParams.get("sku");
   return sku ? PRODUCTS.filter((p) => p.sku === sku) : PRODUCTS;
@@ -355,12 +277,6 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
-        // First — the transient branch below returns early, and this must not
-        // be skipped just because Best Buy had a bad minute.
-        // Quiet when it works; loud when it doesn't — a silently skipped
-        // trigger is indistinguishable from a healthy run otherwise.
-        const gh = await triggerCoachWatcher(env);
-        if (!gh.triggered) console.log("coach trigger skipped:", gh.reason);
         try {
           const results = await check(env, { source: "cron" });
           await pingHeartbeat(env);
@@ -395,7 +311,6 @@ export default {
           return new Response("unauthorized", { status: 401 });
         }
       }
-      // An unknown ?sku= must not silently fall through to "all products".
       if (selectProducts(url).length === 0) {
         return new Response("unknown sku", { status: 404 });
       }
